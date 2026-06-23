@@ -19,6 +19,8 @@ from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pypdf import PdfReader
 
+from telemetry import sample as telemetry_sample
+
 OLLAMA_BASE = "http://localhost:11434"
 STATIC_DIR = Path(__file__).parent / "static"
 MAX_DOC_CHARS = 80_000
@@ -36,6 +38,11 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 @app.get("/")
 async def index():
     return FileResponse(STATIC_DIR / "index.html")
+
+
+@app.get("/api/telemetry")
+async def telemetry():
+    return telemetry_sample()
 
 
 @app.get("/api/health")
