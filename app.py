@@ -9,6 +9,7 @@ import base64
 import io
 import json
 import re
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +19,9 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pypdf import PdfReader
+
+from telemetry import sample as telemetry_sample
+from kill_switch import execute_kill_switch
 
 OLLAMA_BASE = "http://localhost:11434"
 STATIC_DIR = Path(__file__).parent / "static"
@@ -36,6 +40,17 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 @app.get("/")
 async def index():
     return FileResponse(STATIC_DIR / "index.html")
+
+
+@app.get("/api/telemetry")
+async def telemetry():
+    return telemetry_sample()
+
+
+@app.post("/api/shutdown")
+async def shutdown():
+    threading.Thread(target=execute_kill_switch, daemon=True).start()
+    return {"ok": True}
 
 
 @app.get("/api/health")
@@ -231,6 +246,7 @@ async def chat(
     messages: str = Form(...),
     stream: bool = Form(True),
     num_ctx: int = Form(4096),
+    think: str = Form("auto"),
     images: list[UploadFile] = File(default=[]),
     document: UploadFile | None = File(default=None),
 ):
@@ -284,12 +300,17 @@ async def chat(
         history.append(build_user_message("", images_b64, doc_text, doc_name))
 
     ctx = max(512, min(num_ctx, 1_048_576))
-    payload = {
+    payload: dict[str, Any] = {
         "model": model,
         "messages": history,
         "stream": stream,
         "options": {"num_ctx": ctx},
     }
+
+    if think.lower() in ("true", "1", "yes"):
+        payload["think"] = True
+    elif think.lower() not in ("false", "0", "no", "auto"):
+        payload["think"] = think
 
     if not stream:
         try:
