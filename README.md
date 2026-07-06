@@ -49,6 +49,7 @@ ollama list
 - **Streaming replies** — responses appear word-by-word
 - **Images** — attach images; use a **vision** model (e.g. `llama3.2-vision`)
 - **Documents** — PDF, TXT, DOCX text is extracted and sent with your message
+- **Web search** — optional SerpAPI lookup before the model answers (toggle in composer)
 - **New chat** — clear history and start fresh
 - **Dark theme** — similar layout to popular chat UIs
 
@@ -60,6 +61,20 @@ Browser (UI)  →  Python app (port 7860)  →  Ollama API (port 11434)  →  Lo
 
 The UI does not download or run models itself. Ollama handles that.
 
+## Web search (SerpAPI)
+
+Optional web search runs on the Python server (not in the browser). Results are injected into the prompt before Ollama generates a reply.
+
+1. Get an API key from [serpapi.com](https://serpapi.com/).
+2. Save it in **`serpapikey.env`** in this folder (raw key on one line), or use `.env`:
+   ```env
+   SERPAPI_KEY=your_key_here
+   ```
+3. Restart the app (`start.bat` or `python app.py`).
+5. Enable the **Web** toggle next to the message box before sending.
+
+The toggle stays disabled until a key is detected. Do not commit `serpapikey.env` or `.env` — both are in `.gitignore`.
+
 ## Troubleshooting
 
 | Problem | Fix |
@@ -69,12 +84,16 @@ The UI does not download or run models itself. Ollama handles that.
 | Image questions fail | Switch to a vision model like `llama3.2-vision` |
 | PDF empty / garbled | Scanned PDFs need OCR; try a vision model on page screenshots |
 | Port 7860 in use | Change port in `app.py` (last line) |
+| Web toggle disabled | Add your key to `serpapikey.env` and restart the server |
+| Web search failed | Check your SerpAPI quota and key at serpapi.com |
 
 ## File structure
 
 ```
 UI for local LLM/
 ├── app.py           # Backend (FastAPI + Ollama proxy)
+├── serp_search.py   # SerpAPI web search helper
+├── .env.example     # Template for SERPAPI_KEY
 ├── static/          # Chat UI (HTML/CSS/JS)
 ├── requirements.txt
 ├── start.bat        # One-click launcher (Windows)

@@ -9,6 +9,7 @@ import base64
 import io
 import json
 import re
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +19,12 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pypdf import PdfReader
+
+from telemetry import sample as telemetry_sample
+from kill_switch import execute_kill_switch
+from serp_search import build_system_prompt, is_configured, load_serpapi_config, web_search
+
+load_serpapi_config()
 
 OLLAMA_BASE = "http://localhost:11434"
 STATIC_DIR = Path(__file__).parent / "static"
@@ -38,15 +45,35 @@ async def index():
     return FileResponse(STATIC_DIR / "index.html")
 
 
+@app.get("/api/telemetry")
+async def telemetry():
+    return telemetry_sample()
+
+
+@app.post("/api/shutdown")
+async def shutdown():
+    threading.Thread(target=execute_kill_switch, daemon=True).start()
+    return {"ok": True}
+
+
 @app.get("/api/health")
 async def health():
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
             r = await client.get(f"{OLLAMA_BASE}/api/tags")
             r.raise_for_status()
-            return {"ollama": True, "models": r.json().get("models", [])}
+            return {
+                "ollama": True,
+                "models": r.json().get("models", []),
+                "web_search": is_configured(),
+            }
     except Exception as e:
-        return {"ollama": False, "error": str(e)}
+        return {"ollama": False, "error": str(e), "web_search": is_configured()}
+
+
+@app.get("/api/web-search/status")
+async def web_search_status():
+    return {"configured": is_configured()}
 
 
 VISION_NAME_RE = re.compile(
@@ -231,6 +258,8 @@ async def chat(
     messages: str = Form(...),
     stream: bool = Form(True),
     num_ctx: int = Form(4096),
+    think: str = Form("auto"),
+    web_search_enabled: str = Form("false"),
     images: list[UploadFile] = File(default=[]),
     document: UploadFile | None = File(default=None),
 ):
@@ -271,8 +300,10 @@ async def chat(
                 raise HTTPException(400, "Document appears empty or unreadable.")
 
     # Attach files only to the latest user turn
+    search_query = ""
     if history and history[-1].get("role") == "user":
         last = history[-1]
+        search_query = (last.get("content") or "").strip()
         user_msg = build_user_message(
             last.get("content", ""),
             images_b64,
@@ -283,16 +314,42 @@ async def chat(
     else:
         history.append(build_user_message("", images_b64, doc_text, doc_name))
 
+    use_web_search = web_search_enabled.lower() in ("true", "1", "yes")
+    if use_web_search and not is_configured():
+        raise HTTPException(
+            400,
+            "Web search is enabled but SERPAPI_KEY is missing. "
+            "Add your key to serpapikey.env or .env and restart the server.",
+        )
+    if use_web_search and not search_query:
+        raise HTTPException(400, "Web search requires a text message.")
+
+    async def enrich_with_search(msgs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if not use_web_search:
+            return msgs
+        results = await web_search(search_query)
+        enriched = list(msgs)
+        enriched.insert(
+            0,
+            {"role": "system", "content": build_system_prompt(results)},
+        )
+        return enriched
+
     ctx = max(512, min(num_ctx, 1_048_576))
-    payload = {
+    base_payload: dict[str, Any] = {
         "model": model,
-        "messages": history,
         "stream": stream,
         "options": {"num_ctx": ctx},
     }
 
+    if think.lower() in ("true", "1", "yes"):
+        base_payload["think"] = True
+    elif think.lower() not in ("false", "0", "no", "auto"):
+        base_payload["think"] = think
+
     if not stream:
         try:
+            payload = {**base_payload, "messages": await enrich_with_search(history)}
             async with httpx.AsyncClient(timeout=600.0) as client:
                 r = await client.post(f"{OLLAMA_BASE}/api/chat", json=payload)
                 r.raise_for_status()
@@ -301,9 +358,28 @@ async def chat(
             raise HTTPException(503, "Cannot reach Ollama.")
         except httpx.HTTPStatusError as e:
             raise HTTPException(e.response.status_code, e.response.text)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        except RuntimeError as e:
+            raise HTTPException(502, str(e))
 
     async def event_stream():
         try:
+            if use_web_search:
+                yield f"data: {json.dumps({'type': 'search_start', 'query': search_query})}\n\n"
+                try:
+                    ollama_history = await enrich_with_search(history)
+                except ValueError as e:
+                    yield f"data: {json.dumps({'error': str(e)})}\n\n"
+                    return
+                except RuntimeError as e:
+                    yield f"data: {json.dumps({'error': str(e)})}\n\n"
+                    return
+                yield f"data: {json.dumps({'type': 'search_done', 'query': search_query})}\n\n"
+            else:
+                ollama_history = history
+
+            payload = {**base_payload, "messages": ollama_history}
             async with httpx.AsyncClient(timeout=600.0) as client:
                 async with client.stream(
                     "POST", f"{OLLAMA_BASE}/api/chat", json=payload

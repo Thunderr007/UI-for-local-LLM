@@ -1,0 +1,5 @@
+.env
+serpapikey.env
+venv/
+__pycache__/
+*.pyc
